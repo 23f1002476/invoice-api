@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from dateutil import parser
 import re
 
-app = FastAPI()
+app = FastAPI(title="Invoice Extractor")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,17 +19,6 @@ class InvoiceRequest(BaseModel):
     invoice_text: str
 
 
-def clean_lines(text):
-    return [l.strip() for l in text.splitlines() if l.strip()]
-
-
-def parse_date(value):
-    try:
-        return parser.parse(value, dayfirst=True).strftime("%Y-%m-%d")
-    except Exception:
-        return None
-
-
 def extract_money(text):
     if not text:
         return None
@@ -42,229 +31,181 @@ def extract_money(text):
     return float(nums[-1].replace(",", ""))
 
 
+def extract_field(text, patterns):
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def parse_invoice(text):
 
-    lines = clean_lines(text)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    invoice_no = None
-    vendor = None
-    date = None
-    amount = None
-    tax = None
-    currency = None
+    result = {
+        "invoice_no": None,
+        "date": None,
+        "vendor": None,
+        "amount": None,
+        "tax": None,
+        "currency": None,
+    }
 
-    # -------------------------------------------------
-    # Invoice Number
-    # -------------------------------------------------
+    # ---------------- Invoice Number ----------------
 
-    patterns = [
-        r"invoice\s*(?:no|number|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
-        r"inv\s*(?:no|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
-        r"bill\s*(?:no|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)"
+    invoice_patterns = [
+        r"Invoice\s*(?:No|Number|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
+        r"Ref(?:erence)?\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
+        r"Inv\s*(?:No|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
+        r"Bill\s*(?:No|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
     ]
 
-    for p in patterns:
-        m = re.search(p, text, re.I)
+    result["invoice_no"] = extract_field(text, invoice_patterns)
+
+    if result["invoice_no"] is None:
+        m = re.search(r"\b[A-Z0-9]{1,8}[\/-][A-Z0-9\/-]+\b", text)
         if m:
-            invoice_no = m.group(1).strip()
-            break
+            result["invoice_no"] = m.group(0)
 
-    if invoice_no is None:
-        m = re.search(r"\b[A-Z]{1,6}-\d{2,10}\b", text)
-        if m:
-            invoice_no = m.group(0)
+    # ---------------- Vendor ----------------
 
-    # -------------------------------------------------
-    # Vendor
-    # -------------------------------------------------
-
-    vendor_labels = [
-        "vendor",
-        "vendor name",
-        "supplier",
-        "supplier name",
-        "seller",
-        "sold by",
-        "company",
-        "company name",
-        "business name",
-        "from"
+    vendor_patterns = [
+        r"Vendor\s*:\s*(.+)",
+        r"Vendor\s*Name\s*:\s*(.+)",
+        r"Seller\s*:\s*(.+)",
+        r"Supplier\s*:\s*(.+)",
+        r"Company\s*:\s*(.+)",
+        r"Business\s*Name\s*:\s*(.+)",
+        r"Client\s*:\s*(.+)",
+        r"Sold\s*By\s*:\s*(.+)",
+        r"From\s*:\s*(.+)",
     ]
 
-    for line in lines:
+    vendor = extract_field(text, vendor_patterns)
 
-        lower = line.lower()
-
-        for label in vendor_labels:
-
-            if lower.startswith(label + ":"):
-                vendor = line.split(":", 1)[1].strip()
-                break
-
-        if vendor:
-            break
+    if vendor:
+        vendor = vendor.split("\n")[0].strip()
 
     if vendor is None:
+        labels = {
+            "vendor",
+            "vendor name",
+            "seller",
+            "supplier",
+            "company",
+            "business name",
+            "client",
+            "sold by",
+            "from",
+        }
 
         for i in range(len(lines) - 1):
-
             key = lines[i].lower().replace(":", "").strip()
-
-            if key in vendor_labels:
+            if key in labels:
                 vendor = lines[i + 1]
                 break
 
-    # -------------------------------------------------
-    # Date
-    # -------------------------------------------------
+    result["vendor"] = vendor
 
-    date_labels = [
-        "invoice date",
-        "bill date",
-        "issue date",
-        "issued on",
-        "date"
+    # ---------------- Date ----------------
+
+    date_patterns = [
+        r"Invoice\s*Date\s*:\s*(.+)",
+        r"Date\s*:\s*(.+)",
+        r"Issued\s*:\s*(.+)",
+        r"Issued\s*On\s*:\s*(.+)",
+        r"Bill\s*Date\s*:\s*(.+)",
     ]
 
-    for line in lines:
+    raw_date = extract_field(text, date_patterns)
 
-        lower = line.lower()
+    if raw_date:
+        try:
+            result["date"] = parser.parse(
+                raw_date,
+                dayfirst=True
+            ).strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
-        for label in date_labels:
+    # ---------------- Amount ----------------
 
-            if lower.startswith(label + ":"):
-                date = parse_date(line.split(":", 1)[1].strip())
-                break
-
-        if date:
-            break
-
-    if date is None:
-
-        for i in range(len(lines) - 1):
-
-            key = lines[i].lower().replace(":", "").strip()
-
-            if key in date_labels:
-                date = parse_date(lines[i + 1])
-                break
-
-    # -------------------------------------------------
-    # Amount (Subtotal)
-    # -------------------------------------------------
-
-    amount_labels = [
-        "subtotal",
-        "sub total",
-        "net amount",
-        "amount before tax",
-        "taxable amount"
+    amount_patterns = [
+        r"Subtotal\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+        r"Sub\s*Total\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+        r"Amount\s*Before\s*Tax\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+        r"Taxable\s*Amount\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+        r"Net\s*Amount\s*[:\-]?\s*.*?([\d,]+\.\d+)",
     ]
 
-    for line in lines:
-
-        lower = line.lower()
-
-        for label in amount_labels:
-
-            if label in lower:
-                amount = extract_money(line)
-                break
-
-        if amount is not None:
+    for p in amount_patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            result["amount"] = float(m.group(1).replace(",", ""))
             break
 
-    if amount is None:
+    # ---------------- Tax ----------------
 
-        for i in range(len(lines) - 1):
+    # Case 1: GST / VAT / IGST directly
+    tax_patterns = [
+        r"GST(?:\s*\([^)]*\))?\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+        r"VAT(?:\s*\([^)]*\))?\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+        r"IGST(?:\s*\([^)]*\))?\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+        r"Tax\s*Amount\s*[:\-]?\s*.*?([\d,]+\.\d+)",
+    ]
 
-            key = lines[i].lower().replace(":", "").strip()
+    for p in tax_patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            result["tax"] = float(m.group(1).replace(",", ""))
+            break
 
-            if key in amount_labels:
-                amount = extract_money(lines[i + 1])
-                break
+    # Case 2: CGST + SGST
+    if result["tax"] is None:
 
-    # -------------------------------------------------
-    # Tax
-    # -------------------------------------------------
+        cgst = None
+        sgst = None
 
-    tax_total = 0.0
-    found_tax = False
+        m = re.search(r"CGST.*?([\d,]+\.\d+)", text, re.I)
+        if m:
+            cgst = float(m.group(1).replace(",", ""))
 
-    for line in lines:
+        m = re.search(r"SGST.*?([\d,]+\.\d+)", text, re.I)
+        if m:
+            sgst = float(m.group(1).replace(",", ""))
 
-        lower = line.lower()
+        if cgst is not None and sgst is not None:
+            result["tax"] = cgst + sgst
+        elif cgst is not None:
+            result["tax"] = cgst
+        elif sgst is not None:
+            result["tax"] = sgst
 
-        if any(word in lower for word in [
-            "cgst",
-            "sgst",
-            "igst",
-            "gst",
-            "vat",
-            "sales tax",
-            "tax amount",
-            "tax"
-        ]):
-
-            # Skip total amount lines
-            if "total" in lower and "tax" not in lower:
-                continue
-
-            value = extract_money(line)
-
-            if value is not None:
-                tax_total += value
-                found_tax = True
-
-    if found_tax:
-        tax = tax_total
-
-    # Fallback for tax label on one line and value on next
-    if tax is None:
-
-        for i in range(len(lines) - 1):
-
-            key = lines[i].lower().replace(":", "").strip()
-
-            if key in [
-                "gst",
-                "cgst",
-                "sgst",
-                "igst",
-                "vat",
-                "tax",
-                "tax amount",
-                "gst amount"
-            ]:
-                value = extract_money(lines[i + 1])
-
-                if value is not None:
-                    tax = value
-                    break
-
-    # -------------------------------------------------
-    # Currency
-    # -------------------------------------------------
+    # ---------------- Currency ----------------
 
     upper = text.upper()
 
-    if "₹" in text or "INR" in upper or "RS." in upper or "RS " in upper:
-        currency = "INR"
-    elif "$" in text or "USD" in upper:
-        currency = "USD"
-    elif "€" in text or "EUR" in upper:
-        currency = "EUR"
-    elif "£" in text or "GBP" in upper:
-        currency = "GBP"
+    if "CURRENCY:" in upper:
+        m = re.search(r"Currency\s*:\s*([A-Za-z]{3})", text, re.I)
+        if m:
+            result["currency"] = m.group(1).upper()
 
-    return {
-        "invoice_no": invoice_no,
-        "date": date,
-        "vendor": vendor,
-        "amount": amount,
-        "tax": tax,
-        "currency": currency
-    }
+    if result["currency"] is None:
+
+        if "₹" in text or "RS." in upper or "RS " in upper:
+            result["currency"] = "INR"
+
+        elif "USD" in upper or "$" in text:
+            result["currency"] = "USD"
+
+        elif "EUR" in upper or "€" in text:
+            result["currency"] = "EUR"
+
+        elif "GBP" in upper or "£" in text:
+            result["currency"] = "GBP"
+
+    return result
 
 
 @app.post("/extract")
