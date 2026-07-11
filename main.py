@@ -6,9 +6,10 @@ import re
 
 app = FastAPI()
 
-# -------------------------
+# ------------------------
 # Enable CORS
-# -------------------------
+# ------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,23 +18,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------
-# Request Model
-# -------------------------
+
 class InvoiceRequest(BaseModel):
     invoice_text: str
 
 
-# -------------------------
-# Helper Functions
-# -------------------------
-def extract_money(text):
-    if not text:
+# ------------------------
+# Helpers
+# ------------------------
+
+def get_lines(text):
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def extract_money(value):
+    if value is None:
         return None
 
-    text = text.replace(",", "")
+    value = value.replace(",", "")
 
-    m = re.search(r"(\d+(?:\.\d+)?)", text)
+    m = re.search(r"(\d+(?:\.\d+)?)", value)
 
     if m:
         return float(m.group(1))
@@ -41,7 +45,7 @@ def extract_money(text):
     return None
 
 
-def extract_first(text, patterns):
+def search_patterns(text, patterns):
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if m:
@@ -49,22 +53,32 @@ def extract_first(text, patterns):
     return None
 
 
-# -------------------------
-# Invoice Parser
-# -------------------------
+def next_line_value(lines, labels):
+    for i, line in enumerate(lines[:-1]):
+        normalized = line.lower().replace(":", "").strip()
+
+        if normalized in labels:
+            return lines[i + 1].strip()
+
+    return None
+
+
+# ------------------------
+# Main Parser
+# ------------------------
+
 def parse_invoice(text):
+
+    lines = get_lines(text)
 
     # ---------------- Invoice Number ----------------
 
-    invoice_patterns = [
+    invoice_no = search_patterns(text, [
         r"Invoice\s*(?:No|Number|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
         r"Inv\s*(?:No|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
-        r"Bill\s*(?:No|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)",
-    ]
+        r"Bill\s*(?:No|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)"
+    ])
 
-    invoice_no = extract_first(text, invoice_patterns)
-
-    # Fallback for IDs like QX-2200
     if invoice_no is None:
         m = re.search(r"\b[A-Z]{1,6}-\d{2,10}\b", text)
         if m:
@@ -72,28 +86,49 @@ def parse_invoice(text):
 
     # ---------------- Vendor ----------------
 
-    vendor_patterns = [
+    vendor = search_patterns(text, [
+        r"Vendor\s*Name\s*:\s*(.+)",
         r"Vendor\s*:\s*(.+)",
+        r"Supplier\s*Name\s*:\s*(.+)",
         r"Supplier\s*:\s*(.+)",
+        r"Seller\s*:\s*(.+)",
         r"Sold\s*By\s*:\s*(.+)",
         r"Company\s*:\s*(.+)",
-        r"From\s*:\s*(.+)",
-    ]
+        r"Company\s*Name\s*:\s*(.+)",
+        r"Business\s*Name\s*:\s*(.+)",
+        r"From\s*:\s*(.+)"
+    ])
 
-    vendor = extract_first(text, vendor_patterns)
-
-    if vendor:
-        vendor = vendor.split("\n")[0].strip()
+    if vendor is None:
+        vendor = next_line_value(lines, [
+            "vendor",
+            "vendor name",
+            "supplier",
+            "supplier name",
+            "seller",
+            "company",
+            "company name",
+            "from"
+        ])
 
     # ---------------- Date ----------------
 
-    date_patterns = [
+    raw_date = search_patterns(text, [
         r"Invoice\s*Date\s*:\s*(.+)",
-        r"Date\s*:\s*(.+)",
+        r"Bill\s*Date\s*:\s*(.+)",
+        r"Issue\s*Date\s*:\s*(.+)",
         r"Issued\s*On\s*:\s*(.+)",
-    ]
+        r"Date\s*:\s*(.+)"
+    ])
 
-    raw_date = extract_first(text, date_patterns)
+    if raw_date is None:
+        raw_date = next_line_value(lines, [
+            "invoice date",
+            "bill date",
+            "issue date",
+            "issued on",
+            "date"
+        ])
 
     date = None
 
@@ -103,31 +138,50 @@ def parse_invoice(text):
         except Exception:
             pass
 
-    # ---------------- Amount (Subtotal) ----------------
+    # ---------------- Amount ----------------
 
-    amount_patterns = [
+    raw_amount = search_patterns(text, [
         r"Subtotal\s*:\s*(.+)",
         r"Sub\s*Total\s*:\s*(.+)",
-        r"Amount\s*Before\s*Tax\s*:\s*(.+)",
         r"Net\s*Amount\s*:\s*(.+)",
-    ]
+        r"Amount\s*Before\s*Tax\s*:\s*(.+)",
+        r"Taxable\s*Amount\s*:\s*(.+)"
+    ])
 
-    raw_amount = extract_first(text, amount_patterns)
+    if raw_amount is None:
+        raw_amount = next_line_value(lines, [
+            "subtotal",
+            "sub total",
+            "net amount",
+            "amount before tax",
+            "taxable amount"
+        ])
+
     amount = extract_money(raw_amount)
 
     # ---------------- Tax ----------------
 
-    tax_patterns = [
+    raw_tax = search_patterns(text, [
         r"GST.*?:\s*(.+)",
         r"CGST.*?:\s*(.+)",
         r"SGST.*?:\s*(.+)",
         r"IGST.*?:\s*(.+)",
         r"VAT.*?:\s*(.+)",
         r"Sales\s*Tax.*?:\s*(.+)",
-        r"Tax.*?:\s*(.+)",
-    ]
+        r"Tax\s*:\s*(.+)"
+    ])
 
-    raw_tax = extract_first(text, tax_patterns)
+    if raw_tax is None:
+        raw_tax = next_line_value(lines, [
+            "gst",
+            "cgst",
+            "sgst",
+            "igst",
+            "vat",
+            "sales tax",
+            "tax"
+        ])
+
     tax = extract_money(raw_tax)
 
     # ---------------- Currency ----------------
@@ -151,13 +205,10 @@ def parse_invoice(text):
         "vendor": vendor,
         "amount": amount,
         "tax": tax,
-        "currency": currency,
+        "currency": currency
     }
 
 
-# -------------------------
-# API Endpoint
-# -------------------------
 @app.post("/extract")
 def extract(req: InvoiceRequest):
     return parse_invoice(req.invoice_text)
